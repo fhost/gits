@@ -1,0 +1,256 @@
+#! /bin/bash
+
+# Copyright (c) 2014-2015 Alexis Cellier <alexis.cellier@openwide.fr>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+function error ()
+{
+	if [ -t 2 ]; then
+		echo -e "\e[1;31merror\e[0m: \e[0;31m$1\e[0m" >&2
+	else
+		echo "error: $1"
+	fi
+	[ $2 -ne 0 ] && exit $2
+}
+
+function warning ()
+{
+	if [ -t 2 ]; then
+		echo -e "\e[1;33mwarning\e[0m: \e[0;33m$1\e[0m" >&2
+	else
+		echo "warning: $1"
+	fi
+}
+
+function info ()
+{
+	if [ -t 2 ]; then
+		echo -e "\e[1;37minfo\e[0m: \e[0;37m$1\e[0m" >&2
+	else
+		echo "info: $1"
+	fi
+}
+
+function target ()
+{
+	[ -z "${BLD_DIR}" ] && BLD_DIR="$(pwd)"
+	[ -z "${LCL_DIR}" ] && LCL_DIR="$(pwd)"
+
+	if [ ! -f ${BLD_DIR}/conf/src-directory ]; then
+		error "error: this directory is not configured" 2
+	fi
+
+	SRC_DIR="$(cat ${BLD_DIR}/conf/src-directory)"
+
+	machine="$(grep "^MACHINE =" ${BLD_DIR}/conf/local.conf)"
+	machine="${machine#*\"}"
+	echo "machine='${machine%\"}'"
+
+	distro="$(grep "^DISTRO =" ${BLD_DIR}/conf/local.conf)"
+	distro="${distro#*\"}"
+	echo "distro='${distro%\"}'"
+
+	local="$(diff --changed-group-format='%>' --unchanged-group-format='' \
+                 ${LCL_DIR}/local.conf ${BLD_DIR}/conf/local.conf | \
+                 grep -v "^DISTRO =" | grep -v "^MACHINE =" | grep -v "^\s*$")"
+	if [ -n "$local" ]; then
+		echo "local='"
+		echo "${local}"
+		echo "'"
+	fi
+
+	echo "layers='"
+	IFS=$'\n'
+	for layer in $(grep "${SRC_DIR}" ${BLD_DIR}/conf/bblayers.conf); do
+		layer="${layer##*/}"
+		layer="${layer%% *}"
+		echo "${layer}"
+	done
+	echo "'"
+
+	echo "manifest='"
+	tmp="$(mktemp)"
+	eval gits ${gits_options} --dir ${SRC_DIR} manifest >> ${tmp}
+	for used_git in $(grep "${SRC_DIR}" ${BLD_DIR}/conf/bblayers.conf); do
+		used_git="${used_git#*${SRC_DIR}/}"
+		used_git="${used_git%%/*}"
+		used_git="${used_git%% *}"
+		used_gits="${used_gits} ${used_git}"
+	done
+	used_gits="${used_gits} bitbake"
+	for git in $(cat $tmp); do
+		[[ "${used_gits}" =~ ${git%%,*} ]] && echo ${git}
+	done
+	echo "'"
+	rm -f $tmp
+}
+
+function configure ()
+{
+	[ -z ${BLD_DIR} ] && BLD_DIR="$(pwd)/${1##*/}"
+	[ -z ${SRC_DIR} ] && SRC_DIR="${BLD_DIR}/src/"
+	[ -z ${LCL_DIR} ] && LCL_DIR="$(pwd)"
+
+	[ -f $1 ] || error "cannot find target file ‘$1’" 2
+
+	source $1
+
+	if [ -e ${BLD_DIR} ]; then
+		if [ ! -d ${BLD_DIR} ]; then
+			error "file ‘${BLD_DIR}’ already exists" 2
+		fi
+	else
+		error="$(mkdir -p ${BLD_DIR} 2>&1)"
+		[ $? -ne 0 ] && error "${error}" 1
+	fi
+
+	if [ -z "${no_sync}" ]; then
+		tmp="$(mktemp)"
+		for line in $manifest; do
+			echo $line >> $tmp
+		done
+		eval gits ${gits_options} --dir ${SRC_DIR} sync ${tmp}
+		ret=$?
+		rm -f $tmp
+		[ $ret -ne 0 ] && exit $ret;
+	fi
+
+	if [ -e ${BLD_DIR}/conf -a -z "${force}" ]; then
+		warning "build directory ‘${BLD_DIR}’ is already configured"
+		warning "use --force to override current configuration"
+		return
+	fi
+
+	rm -rf ${BLD_DIR}/conf
+	mkdir -p ${BLD_DIR}/conf
+
+	echo "${SRC_DIR}" > ${BLD_DIR}/conf/src-directory
+
+	cat << "EOF" > ${BLD_DIR}/conf/bblayers.conf
+LCONF_VERSION = "6"
+
+BBPATH = "${TOPDIR}"
+
+BBLAYERS = " \
+EOF
+	for layer in ${layers}; do
+		path="$(find ${SRC_DIR} -path "*${layer}/conf/layer.conf" \
+                        -printf '%P')"
+		if [ -z "$path" ]; then
+			1rm -rf ${BLD_DIR}/conf
+			error "cannot find layer ‘${layer}’ in repositories" 2
+		fi
+		path="${path%/conf/layer.conf}"
+		echo "    ${SRC_DIR}/${path} \\" >> ${BLD_DIR}/conf/bblayers.conf
+	done
+	echo "\"" >> ${BLD_DIR}/conf/bblayers.conf
+
+	if [ ! -e "${LCL_DIR}/local.conf" ]; then
+		if [ ! -e "${LCL_DIR}/local.conf.sample" ]; then
+			error "local.conf not found" 4
+		fi
+		warning "local.conf not found, local.conf.sample to create it"
+		cp ${LCL_DIR}/local.conf.sample ${LCL_DIR}/local.conf
+	fi
+	cp ${LCL_DIR}/local.conf ${BLD_DIR}/conf/local.conf
+	cat << EOF >> ${BLD_DIR}/conf/local.conf
+
+DISTRO = "${distro}"
+MACHINE = "${machine}"
+
+${local}
+EOF
+
+	info "build directory ‘${BLD_DIR}’ configured"
+}
+
+function usage ()
+{
+	cat << EOF
+Usage: $(basename $0) COMMAND [OPTIONS]
+COMMANDS:
+  config <target>      set up bitbake build directory for the given target file
+  target               output the target file of the build directory
+OPTIONS:
+  -f|--force           force the command (may result in the lost of information)
+  -n|--no-sync         config will not synchronize with the target manifest
+  -s|--sources <path>  set sources directory
+                       default value: <name of the target file used>/src
+  -d|--build <path>    set build directory
+                       default value: <name of the target file used>
+  -l|--local <path>    set the directory where to search the user's local.conf
+                       default value: <current directory>
+  -b|--branch-only     ignore revision (use HEAD)
+  -j|--jobs <n>        parallelize synchronization with the number of jobs given
+  -v|--verbose         print git commands outputs
+  -h|--help            print this help
+VARIABLES:
+  SRC_DIR=<path>       set sources directory (equivalent as ‘-sources <path>’)
+  BLD_DIR=<path>       set build directory (equivalent as ‘--build <path>’)
+  LCL_DIR=<path>       set local directory (equivalent as ‘--local <path>’)
+EOF
+}
+
+params=$(getopt -n $(basename $0) \
+                -o fns:d:l:bj:vh \
+                -l force,verbose,help \
+		-l no-sync,sources:,build:,local:,branch-only,jobs: \
+                -- "$@")
+if [ $? -ne 0 ]; then
+	>&2 echo "Try '$(basename $0) --help' for more information"
+	exit
+fi
+eval set -- "${params}"
+
+while :; do
+	case $1 in
+		-f | --force )
+			force="yes";
+			gits_options="${gits_options} $1";
+			shift;;
+		-s | --sources )
+			SRC_DIR="$(pwd)/$2"
+			[ "${2:0:1}" == "/" ] && SRC_DIR="$2"
+			shift 2;;
+		-d | --build )
+			BLD_DIR="$(pwd)/$2"
+			[ "${2:0:1}" == "/" ] && BLD_DIR="$2"
+			shift 2;;
+		-l | --local )
+			LCL_DIR="$(pwd)/$2"
+			[ "${2:0:1}" == "/" ] && LCL_DIR="$2"
+			shift 2;;
+		-n | --no-sync ) no_sync="yes"; shift;;
+		-h | --help ) usage; exit;;
+		-b | --branch-only ) gits_options="${gits_options} $1"; shift;;
+		-j | --jobs ) gits_options="${gits_options} $1 $2"; shift 2;;
+		-v | --verbose ) gits_options="${gits_options} $1"; shift;;
+		-- ) shift; break;;
+		* ) error "unknown option ‘$1’" 1;;
+	esac
+done
+
+while [ $# -gt 0 ]; do
+	case $1 in
+		config ) configure $2; break;;
+		target ) target; break;;
+		* ) error "unknown command ‘$1’" 1;;
+	esac
+done

@@ -1,0 +1,296 @@
+#! /bin/bash
+
+# Copyright (c) 2014-2015 Alexis Cellier <alexis.cellier@openwide.fr>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+function error ()
+{
+	if [ -t 2 ]; then
+		echo -e "\e[1;31merror\e[0m: \e[0;31m$1\e[0m" >&2
+	else
+		echo "error: $1"
+	fi
+	[ $2 -ne 0 ] && exit $2
+}
+
+function warning ()
+{
+	if [ -t 2 ]; then
+		echo -e "\e[1;33mwarning\e[0m: \e[0;33m$1\e[0m" >&2
+	else
+		echo "warning: $1"
+	fi
+}
+
+function info ()
+{
+	if [ -t 2 ]; then
+		echo -e "\e[1;37minfo\e[0m: \e[0;37m$1\e[0m" >&2
+	else
+		echo "info: $1"
+	fi
+}
+
+function interrupt ()
+{
+	error "interrupted" 0
+	kill $$
+}
+
+trap interrupt SIGINT
+
+function projects ()
+{
+	cd ${GITS_DIR}
+	for GIT in $(find -name .git -printf '%P\n'); do
+		[ ${GIT} == ".git" ] && continue
+		PROJECT=${GIT%%/.git}
+		PROJECTS="${PROJECTS}\n${PROJECT}"
+	done
+
+	if [ -z ${PROJECTS} ]; then
+		 error "no git repository found in directory ‘${GITS_DIR}’" 5
+	fi
+
+	echo -e ${PROJECTS} | sort
+}
+
+function manifest ()
+{
+	[ -z "${GITS_DIR}" ] && GITS_DIR="$(pwd)"
+
+	for PROJECT in $(projects); do
+		cd "${GITS_DIR}/${PROJECT}"
+
+		URI="$(git config remote.origin.url)"
+		BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+		REV="$(git rev-parse HEAD)"
+		[ -n "${branch_only}" ] && REV="HEAD"
+		INFO="${PROJECT},${URI},${BRANCH},${REV}"
+
+		DIFFS="$(git diff | wc -l)"
+		COMMITS="$(git log --branches --not --remotes | wc -l)"
+
+		if [ "${DIFFS}" -ne 0 -o "${COMMITS}" -ne 0 ]; then
+			warning "${PROJECT} has local modifications or commits"
+		fi
+
+		echo "${INFO}"
+	done
+}
+
+function synchronize_call ()
+{
+	INFO="$*"
+
+	PROJECT="$(echo ${INFO} | awk -F "," '{ print $1 }')"
+	URI="$(echo ${INFO} | awk -F "," '{ print $2 }')"
+	BRANCH="$(echo ${INFO} | awk -F "," '{ print $3 }')"
+	REV="$(echo ${INFO} | awk -F "," '{ print $4 }')"
+	[ -n "${branch_only}" ] && REV="HEAD"
+	DIR="${GITS_DIR}/${PROJECT}"
+
+	info "Synchronizing project ${PROJECT}..."
+
+	if [ ! -e ${DIR} ]; then
+		git clone ${URI} ${DIR} ${verbose}
+		[ $? -ne 0 ] && error "  fail to clone ‘${URI}’" 3
+
+		cd ${DIR}
+
+		if [ $(git branch --list ${BRANCH} | wc -l) -eq 0 ]; then
+			git checkout origin/${BRANCH} -b ${BRANCH} ${verbose}
+		else
+			git checkout ${BRANCH} ${verbose}
+		fi
+		[ $? -ne 0 ] && error "  fail to checkout branch ‘${BRANCH}’" 3
+
+		git reset --hard ${REV} ${verbose}
+		[ $? -ne 0 ] && error "  fail to set to revision ‘${REV}’" 3
+
+		continue
+	fi
+
+	cd ${DIR}
+
+	CURRENT_URI="$(git config remote.origin.url)"
+	CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+	CURRENT_REV="$(git rev-parse HEAD)"
+
+	if [ -z "${force}" ]; then
+		DIFFS="$(git diff | wc -l)"
+		COMMITS="$(git log --branches --not --remotes | wc -l)"
+
+		if [ ${DIFFS} -ne 0 -o ${COMMITS} -ne 0 ]; then
+			error "${PROJECT} has local modifications or commits" 0
+			error "these modification or commits will be lost" 0
+			error "use ‘--force’ option to force synchronisation" 4
+		fi
+	fi
+
+	if [ "${CURRENT_URI}" != "${URI}" ]; then
+		info "  changing URI: ‘${CURRENT_URI}’ -> ‘${URI}’"
+		git remote set-url origin ${URI}
+		git remote update >/dev/null
+		[ $? -ne 0 ] && error "  fail to change URI" 3
+	fi
+
+	git fetch ${verbose}
+
+	if [ "${CURRENT_BRANCH}" != "${BRANCH}" ]; then
+		info "  changing branch: ‘${CURRENT_BRANCH}’ -> ‘${BRANCH}’"
+		if [ $(git branch --list ${BRANCH} | wc -l) -eq 0 ]; then
+			git checkout origin/${BRANCH} -b ${BRANCH} ${verbose}
+		else
+			git checkout ${BRANCH} ${verbose}
+		fi
+		[ $? -ne 0 ] && error "  fail to switch to branch ‘${BRANCH}’" 3
+	fi
+
+	if [ "${REV}" == "HEAD" ]; then
+		git reset --hard HEAD ${verbose}
+		git pull ${verbose}
+	elif [ "${CURRENT_REV}" != "${REV}" ]; then
+		info "  changing revision: ‘${CURRENT_REV}’ -> ‘${REV}’"
+		git reset --hard ${REV} ${verbose}
+		[ $? -ne 0 ] && error "  fail to change revision to ‘${REV}’" 3
+	fi
+}
+
+function synchronize ()
+{
+	[ -z ${GITS_DIR} ] && GITS_DIR="$(pwd)"
+
+	[ ! -f $1 ] && error "cannot find manifest file ‘$1’" 2
+
+	if [ -e ${GITS_DIR} ]; then
+		if [ ! -d ${GITS_DIR} ]; then
+			error "file ‘${GITS_DIR}’ already exists" 2
+		fi
+	else
+		error="$(mkdir -p ${GITS_DIR} 2>&1)"
+		[ $? -ne 0 ] && error "${error}" 1
+	fi
+
+	current_jobs=0
+	for INFO in $(cat $1); do
+		if [ $jobs -ne 0 ]; then
+			if [ $current_jobs -ge $jobs ]; then
+				wait -n
+				current_jobs=$(($current_jobs - 1))
+			fi
+			synchronize_call "$INFO" &
+			current_jobs=$(($current_jobs + 1))
+		else
+			synchronize_call "$INFO"
+		fi
+	done
+
+	[ $jobs -ne 0 ] && wait
+}
+
+function foreach_call ()
+{
+	PROJECT="$1"
+	shift
+	info "Executing command ‘git $(echo "$@")’ in project ${PROJECT}"
+	cd ${GITS_DIR}/${PROJECT}
+	git $@
+	ret=$?
+	[ $ret -ne 0 ] && error "command failed (ret=${ret})" 0
+}
+
+function foreach ()
+{
+	[ -z ${GITS_DIR} ] && GITS_DIR="$(pwd)"
+
+	current_jobs=0
+	for PROJECT in $(projects); do
+		if [ $jobs -ne 0 ]; then
+			if [ $current_jobs -ge $jobs ]; then
+				wait -n
+				current_jobs=$(($current_jobs - 1))
+			fi
+			foreach_call "$PROJECT" "$@" &
+			current_jobs=$(($current_jobs + 1))
+		else
+			foreach_call "$PROJECT" "$@"
+		fi
+	done
+
+	[ $jobs -ne 0 ] && wait
+}
+
+function usage ()
+{
+	cat << EOF
+Usage: $(basename $0) COMMAND [OPTIONS]
+COMMANDS:
+  sync <manifest>      synchronize repositories with the given manifest
+  manifest             output a manifest of the current state of the repositories
+  foreach <command>    execute the given git command in each repositories
+OPTIONS:
+  -f|--force           force the command (may result in the lost of information)
+  -b|--branch-only     ignore revision (use HEAD instead)
+  -j|--jobs <n>        parallelize commands with the number of jobs given
+  -d|--dir <path>      set gits directory (instead of using current directory)
+  -v|--verbose         print git commands output
+  -h|--help            print this short help
+VARIABLES:
+  GITS_DIR=<path>      set gits directory (equivalent as ‘--dir <path>’)
+EOF
+}
+
+params=$(getopt -n $(basename $0) \
+		-o fbj:d:vh \
+		-l force,branch-only,jobs:,dir:,verbose,help \
+		-- "$@")
+if [ $? -ne 0 ]; then
+	>&2 echo "Try '$(basename $0) --help' for more information"
+	exit
+fi
+eval set -- "${params}"
+
+verbose="-q"
+jobs=0
+while :; do
+	case $1 in
+		-f | --force ) force="yes"; shift;;
+		-b | --branch-only ) branch_only="yes"; shift;;
+		-j | --jobs ) jobs=$2; shift 2;;
+		-d | --dir)
+			GITS_DIR="$(pwd)/$2"
+			[ "${2:0:1}" == "/" ] && GITS_DIR="$2"
+			shift 2;;
+		-v | --verbose ) verbose=""; shift;;
+		-h | --help ) usage; exit;;
+		-- ) shift; break;;
+		* ) error "unknown option ‘$1’" 1; exit;;
+	esac
+done
+
+while [ $# -gt 0 ]; do
+	case $1 in
+		sync ) synchronize $2; break;;
+		manifest ) manifest; break;;
+		foreach ) shift; foreach $@; break;;
+		* ) error "unknown command ‘$1’" 1; break;;
+	esac
+done
